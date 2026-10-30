@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QDir>
+#include <QStandardPaths>
 #include <QJsonObject>
 #include <algorithm>
 #include <cstdlib>
@@ -70,7 +71,12 @@ VulkanHDR::VulkanHDR(VkInstance instance,VkPhysicalDevice physical,VkDevice devi
     auto& s=*impl;s.device=device;s.extent=extent;s.gdpa=gdpa;s.targets=targets;s.input=input;
     auto getMemory=reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(gipa(instance,"vkGetPhysicalDeviceMemoryProperties"));getMemory(physical,&s.memory);
     std::wstring libs=QString::fromUtf8(TRUEHDR_RUNTIME_SITE "/nvvfx/libs").toStdWString();const wchar_t* paths[]{libs.c_str()};
-    QString directory=QFileInfo(qEnvironmentVariable("TRUEHDR_PROFILE",QString::fromUtf8(TRUEHDR_DEFAULT_PROFILE))).absolutePath()+"/output/vulkan-ngx";QDir().mkpath(directory);auto logs=directory.toStdWString();
+#ifdef TRUEHDR_SYSTEM_PACKAGE
+    const QString defaultProfile=QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)+"/chaos-hdr/profile.json";
+#else
+    const QString defaultProfile=QString::fromUtf8(TRUEHDR_DEFAULT_PROFILE);
+#endif
+    QString directory=QFileInfo(qEnvironmentVariable("TRUEHDR_PROFILE",defaultProfile)).absolutePath()+"/output/vulkan-ngx";QDir().mkpath(directory);auto logs=directory.toStdWString();
     NVSDK_NGX_FeatureCommonInfo info{};info.PathListInfo={paths,1};info.LoggingInfo={logMessage,NVSDK_NGX_LOGGING_LEVEL_OFF,true};
     ngxChecked(NVSDK_NGX_VULKAN_Init_with_ProjectID("64dc46e1-cd39-4a64-b750-227198d73e75",NVSDK_NGX_ENGINE_TYPE_CUSTOM,"0.1",logs.c_str(),instance,physical,device,gipa,gdpa,&info),"Initialize Vulkan NGX");s.initialized=true;
     ngxChecked(NVSDK_NGX_VULKAN_AllocateParameters(&s.parameters),"Allocate Vulkan controls");

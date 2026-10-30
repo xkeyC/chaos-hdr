@@ -5,7 +5,9 @@
 #include <QFile>
 #include <QCoreApplication>
 #include <QVariant>
+#include <algorithm>
 #include <array>
+#include <string>
 #include <vector>
 #include <cstring>
 #include <stdexcept>
@@ -19,6 +21,11 @@ namespace {
 void check(VkResult r,const char* action){if(r!=VK_SUCCESS)throw std::runtime_error(std::string(action)+" failed: "+std::to_string(r));}
 void glCheck(const char* action){auto e=glGetError();
         if(e!=GL_NO_ERROR)throw std::runtime_error(std::string(action)+" OpenGL error: "+std::to_string(e));}
+struct PrepareConstants {
+    uint32_t width,height;float intensity,grain;uint32_t mode,flags;
+    float deband,exposure,peak,middle,midGamma,contrast,saturation,pHdr;
+    float highlightStart,highlightGain,shadowStart,shadowPower,knee,slope,top;uint32_t power;
+};
 }
 struct DesktopGPU::Impl {
     uint32_t width{},height{},family{};
@@ -27,7 +34,8 @@ struct DesktopGPU::Impl {
     VkCommandPool pool{};VkCommandBuffer command{};VkFence fence{};
     struct Image {VkImage image{};VkDeviceMemory memory{};VkImageView view{};GLuint texture{},glMemory{};} source,prepared,output;
     VkSemaphore ready{},done{};GLuint glReady{},glDone{};
-    bool directMode=false,outputReleased=false,submitted=false,poisoned=false,retired=false;
+    bool directMode=false,outputReleased=false,submitted=false,poisoned=false,retired=false,rtxBroken=false;
+    std::string rtxProblem;ShaderTone tone;
     GLsync retirementFence{};
 #ifdef TRUEHDR_DEVELOPMENT
     int completionTest=0;
@@ -181,14 +189,21 @@ struct DesktopGPU::Impl {
             vkCmdResetQueryPool(command,queries,0,3);vkCmdWriteTimestamp(command,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,queries,0);
         }
         constexpr float sharpenGain=3.f;
-        struct {uint32_t width,height;float intensity,grain;uint32_t hdr;} push{width,height,sharpen*sharpenGain,ignoreGrain,hdr?1u:0u};
+        const uint32_t mode=!hdr?1u:engine?0u:2u;
+        const uint32_t flags=(tone.adaptiveSharpen?1u:0u)|((mode==2&&tone.debanding)||(mode==0&&tone.debandBeforeRtx)?2u:0u);
+        PrepareConstants push{width,height,sharpen*sharpenGain,ignoreGrain,mode,flags,tone.deband,tone.exposure,tone.peak,tone.middle,tone.midGamma,tone.contrast,tone.saturation,tone.pHdr,
+            tone.highlightStart,tone.highlightGain,tone.shadowStart,tone.shadowPower,tone.knee,tone.slope,tone.top,tone.power?1u:0u};
         vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_COMPUTE,layout,0,1,&set,0,nullptr);
         vkCmdPushConstants(command,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(push),&push);vkCmdDispatch(command,(width+15)/16,(height+15)/16,1);
         if(timing)vkCmdWriteTimestamp(command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,queries,1);
-        if(hdr)engine->record(command,0,true,++frames);
+        if(hdr&&engine){
+            try{engine->record(command,0,true,++frames);}
+            catch(const std::exception& e){rtxBroken=true;rtxProblem=e.what();throw;}
+        }
         if(timing){vkCmdWriteTimestamp(command,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,queries,2);previousTimed=true;}
     }
     ~Impl(){
+        if(!retirementReady()&&!poisoned&&!submitted&&retirementFence)glClientWaitSync(retirementFence,GL_SYNC_FLUSH_COMMANDS_BIT,100'000'000);
         if(!retirementReady()){DesktopGPU::quarantine();engine.release();return;}
         if(retirementFence)glDeleteSync(retirementFence);
         engine.reset();
@@ -217,7 +232,7 @@ struct DesktopGPU::Impl {
         if(instance)vkDestroyInstance(instance,nullptr);
     }
 };
-DesktopGPU::DesktopGPU(uint32_t width,uint32_t height,bool direct):impl(std::make_unique<Impl>()){
+DesktopGPU::DesktopGPU(uint32_t width,uint32_t height,bool direct,RtxMode rtx):impl(std::make_unique<Impl>()){
     if(recoveryRequired())throw std::runtime_error("HDR GPU recovery requires signing out and back in");
     auto& s=*impl;s.width=width;s.height=height;s.directMode=direct;
     for(auto ext:{"GL_EXT_memory_object_fd","GL_EXT_semaphore_fd"})if(!epoxy_has_gl_extension(ext))throw std::runtime_error(std::string("Missing graphics interop extension: ")+ext);
@@ -225,14 +240,29 @@ DesktopGPU::DesktopGPU(uint32_t width,uint32_t height,bool direct):impl(std::mak
     VkInstanceCreateInfo create{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};create.pApplicationInfo=&app;check(vkCreateInstance(&create,nullptr,&s.instance),"Create desktop Vulkan instance");
     uint32_t count=0;check(vkEnumeratePhysicalDevices(s.instance,&count,nullptr),"List GPUs");std::vector<VkPhysicalDevice> devices(count);check(vkEnumeratePhysicalDevices(s.instance,&count,devices.data()),"List GPUs");
     GLubyte uuid[16]{};glGetUnsignedBytei_vEXT(GL_DEVICE_UUID_EXT,0,uuid);glCheck("Read compositor GPU identity");
+    bool nvidia=false;
     for(auto device:devices){VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};VkPhysicalDeviceProperties2 p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};p.pNext=&id;vkGetPhysicalDeviceProperties2(device,&p);
-        if(p.properties.vendorID==0x10de&&std::memcmp(uuid,id.deviceUUID,16)==0){s.physical=device;break;}}
-    if(!s.physical)throw std::runtime_error("No NVIDIA Vulkan GPU matches the desktop OpenGL GPU");
+        bool vendor=p.properties.vendorID==0x10de;
+        if((vendor||rtx!=RtxMode::Required)&&std::memcmp(uuid,id.deviceUUID,16)==0){s.physical=device;nvidia=vendor;break;}}
+    if(!s.physical)throw std::runtime_error(rtx==RtxMode::Required?"No NVIDIA Vulkan GPU matches the desktop OpenGL GPU":"No Vulkan GPU matches the desktop OpenGL GPU");
     VkPhysicalDeviceProperties properties;vkGetPhysicalDeviceProperties(s.physical,&properties);s.timestampPeriod=properties.limits.timestampPeriod;
     uint32_t families=0;vkGetPhysicalDeviceQueueFamilyProperties(s.physical,&families,nullptr);std::vector<VkQueueFamilyProperties> queues(families);vkGetPhysicalDeviceQueueFamilyProperties(s.physical,&families,queues.data());
     bool found=false;for(uint32_t n=0;n<families;++n)if((queues[n].queueFlags&(VK_QUEUE_GRAPHICS_BIT|VK_QUEUE_COMPUTE_BIT))==(VK_QUEUE_GRAPHICS_BIT|VK_QUEUE_COMPUTE_BIT)){s.family=n;found=true;break;}
     if(!found)throw std::runtime_error("No graphics/compute queue");
-    std::vector<const char*> extensions{"VK_KHR_external_memory_fd","VK_KHR_external_semaphore_fd","VK_NVX_binary_import","VK_NVX_image_view_handle","VK_KHR_push_descriptor"};
+    std::vector<const char*> extensions{"VK_KHR_external_memory_fd","VK_KHR_external_semaphore_fd"};
+    constexpr std::array rtxExtensions{"VK_NVX_binary_import","VK_NVX_image_view_handle","VK_KHR_push_descriptor"};
+    bool useRtx=rtx!=RtxMode::Off;
+    if(useRtx&&rtx==RtxMode::Preferred){
+        if(!nvidia){useRtx=false;s.rtxProblem="RTX HDR needs an NVIDIA GPU; the desktop is rendering on another GPU.";}
+        else{
+            uint32_t available=0;check(vkEnumerateDeviceExtensionProperties(s.physical,nullptr,&available,nullptr),"List GPU extensions");
+            std::vector<VkExtensionProperties> supported(available);check(vkEnumerateDeviceExtensionProperties(s.physical,nullptr,&available,supported.data()),"List GPU extensions");
+            for(auto name:rtxExtensions)if(std::none_of(supported.begin(),supported.end(),[&](const auto& item){return std::strcmp(item.extensionName,name)==0;})){
+                useRtx=false;s.rtxProblem=std::string("The NVIDIA driver does not offer ")+name+".";
+            }
+        }
+    }
+    if(useRtx)extensions.insert(extensions.end(),rtxExtensions.begin(),rtxExtensions.end());
     if(direct)for(auto name:{"VK_EXT_external_memory_dma_buf","VK_EXT_image_drm_format_modifier","VK_EXT_queue_family_foreign"})extensions.push_back(name);
     float priority=1;VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};queue.queueFamilyIndex=s.family;queue.queueCount=1;queue.pQueuePriorities=&priority;
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};features.pNext=&f12;vkGetPhysicalDeviceFeatures2(s.physical,&features);
@@ -246,7 +276,7 @@ DesktopGPU::DesktopGPU(uint32_t width,uint32_t height,bool direct):impl(std::mak
     if(direct){VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};check(vkCreateSemaphore(s.device,&info,nullptr,&s.producerReady),"Create submitted-frame acquire semaphore");}
     VkDescriptorSetLayoutBinding bindings[3]{{0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},{2,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}};
     VkDescriptorSetLayoutCreateInfo desc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};desc.bindingCount=3;desc.pBindings=bindings;check(vkCreateDescriptorSetLayout(s.device,&desc,nullptr,&s.descriptors),"Create prepare descriptors");
-    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT,0,20};VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};layout.setLayoutCount=1;layout.pSetLayouts=&s.descriptors;layout.pushConstantRangeCount=1;layout.pPushConstantRanges=&push;check(vkCreatePipelineLayout(s.device,&layout,nullptr,&s.layout),"Create prepare layout");
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(PrepareConstants)};VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};layout.setLayoutCount=1;layout.pSetLayouts=&s.descriptors;layout.pushConstantRangeCount=1;layout.pPushConstantRanges=&push;check(vkCreatePipelineLayout(s.device,&layout,nullptr,&s.layout),"Create prepare layout");
     QFile shader(TRUEHDR_DESKTOP_SHADER);
     if(!shader.open(QIODevice::ReadOnly))throw std::runtime_error("Desktop shader missing");
     auto bytes=shader.readAll();
@@ -258,8 +288,17 @@ DesktopGPU::DesktopGPU(uint32_t width,uint32_t height,bool direct):impl(std::mak
     VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};sampler.minFilter=sampler.magFilter=VK_FILTER_NEAREST;sampler.addressModeU=sampler.addressModeV=sampler.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;check(vkCreateSampler(s.device,&sampler,nullptr,&s.sampler),"Create prepare sampler");
     VkDescriptorImageInfo infos[3]{{s.sampler,s.source.view,VK_IMAGE_LAYOUT_GENERAL},{VK_NULL_HANDLE,s.prepared.view,VK_IMAGE_LAYOUT_GENERAL},{VK_NULL_HANDLE,s.output.view,VK_IMAGE_LAYOUT_GENERAL}};
     VkWriteDescriptorSet writes[3]{};for(int n=0;n<3;++n){writes[n]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};writes[n].dstSet=s.set;writes[n].dstBinding=n;writes[n].descriptorCount=1;writes[n].descriptorType=bindings[n].descriptorType;writes[n].pImageInfo=&infos[n];}vkUpdateDescriptorSets(s.device,direct?2:3,writes+(direct?1:0),0,nullptr);
-    s.begin();for(auto* image:{&s.source,&s.prepared,&s.output})if(image->image)s.barrier(*image,VK_QUEUE_FAMILY_IGNORED,VK_QUEUE_FAMILY_IGNORED,VK_IMAGE_LAYOUT_UNDEFINED);
-    s.engine=std::make_unique<VulkanHDR>(s.instance,s.physical,s.device,vkGetInstanceProcAddr,vkGetDeviceProcAddr,s.command,VkExtent2D{width,height},s.prepared.image,std::vector<VkImage>{s.output.image});
+    auto initialLayouts=[&]{for(auto* image:{&s.source,&s.prepared,&s.output})if(image->image)s.barrier(*image,VK_QUEUE_FAMILY_IGNORED,VK_QUEUE_FAMILY_IGNORED,VK_IMAGE_LAYOUT_UNDEFINED);};
+    s.begin();initialLayouts();
+    if(useRtx){
+        try{s.engine=std::make_unique<VulkanHDR>(s.instance,s.physical,s.device,vkGetInstanceProcAddr,vkGetDeviceProcAddr,s.command,VkExtent2D{width,height},s.prepared.image,std::vector<VkImage>{s.output.image});}
+        catch(const std::exception& e){
+            if(rtx==RtxMode::Required)throw;
+            s.rtxProblem=e.what();
+            check(vkResetCommandBuffer(s.command,0),"Reset commands");VkCommandBufferBeginInfo start{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};check(vkBeginCommandBuffer(s.command,&start),"Begin HDR commands");
+            initialLayouts();
+        }
+    }
     for(auto* image:{&s.source,&s.output})if(image->image)s.barrier(*image,s.family,VK_QUEUE_FAMILY_EXTERNAL);
     s.submit(false);
 }
@@ -311,7 +350,11 @@ DesktopGPU::Timings DesktopGPU::timings()const{
     auto result=impl->timings;if(result.samples){result.prepare/=result.samples;result.engine/=result.samples;result.total/=result.samples;}return result;
 }
 
-void DesktopGPU::setSettings(const PictureSettings& settings){impl->engine->setSettings(settings);}
+void DesktopGPU::setSettings(const PictureSettings& settings){if(impl->engine)impl->engine->setSettings(settings);}
+void DesktopGPU::setTone(const ShaderTone& tone){impl->tone=tone;}
+bool DesktopGPU::rtxActive()const{return bool(impl->engine)&&!impl->rtxBroken;}
+bool DesktopGPU::rtxFailed()const{return impl->rtxBroken;}
+const char* DesktopGPU::rtxError()const{return impl->rtxProblem.c_str();}
 
 bool DesktopGPU::supportsFormat(uint32_t format){return format==DRM_FORMAT_XRGB8888||format==DRM_FORMAT_ARGB8888||format==DRM_FORMAT_XBGR8888||format==DRM_FORMAT_ABGR8888;}
 bool DesktopGPU::ready()const{bool ready=impl->complete();if(impl->poisoned)throw std::runtime_error("HDR GPU completion failed");return ready;}

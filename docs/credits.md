@@ -43,6 +43,13 @@ The complete distinction between code bundled here, downloaded proprietary depen
 
 These establish that Linux access to NVIDIA’s engine and non-desktop uses already exist. Sample licenses do not relicense NVIDIA’s proprietary runtime.
 
+## Shader engine references
+
+- [Bilibili video BV1uvph6FEnz](https://www.bilibili.com/video/BV1uvph6FEnz): the inspiration for adding a shader HDR engine.
+- [ITU-R BT.2446](https://www.itu.int/rec/R-REC-BT.2446): Method A's conversion, inverted for SDR-to-HDR expansion.
+- [Oklab — Björn Ottosson](https://bottosson.github.io/posts/oklab/): the color space used for saturation.
+- HDR 视界 (HDR Vision) 1.1.0, a browser extension by sabamotto: the reference for the set of controls and the fallback's overall processing order. It ships without a license, so none of its code or tuned values were copied; the shader engine was written independently in display-referred nits.
+
 ## Related methods and alternatives
 
 | Project | Method / contribution | Difference from this integration |

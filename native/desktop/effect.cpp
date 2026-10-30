@@ -31,6 +31,7 @@
 #include <QKeyEvent>
 #include <QDateTime>
 #include <QDir>
+#include <QStandardPaths>
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QElapsedTimer>
@@ -68,7 +69,11 @@ public:
 class TrueHDRDesktop : public Effect {
     Q_OBJECT
     Q_CLASSINFO("D-Bus Interface", "org.truehdr.Desktop")
+#ifdef TRUEHDR_SYSTEM_PACKAGE
+    QString root=QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)+"/chaos-hdr",profile;
+#else
     QString root=QString::fromUtf8(TRUEHDR_ROOT),profile;
+#endif
     QJsonObject config;QString error;QTimer refresh,persistTimer,retryTimer;QProcess pasteProcess;QPointer<QProcess> copyProcess;QTimer pasteTimeout;int retryCount=0;bool settingsDirty=false;ImGuiID pasteField=0;QByteArray clipboardText;
     int displayPeak=1500;bool displayHdr=true;QString displayName,displayError;
     QPointer<LogicalOutput> pictureScreen;QList<QMetaObject::Connection> displayConnections;QFileSystemWatcher settingsWatch;
@@ -93,6 +98,7 @@ class TrueHDRDesktop : public Effect {
     GraphicsBufferRef inFlightBuffer;
     std::shared_ptr<SyncReleasePoint> inFlightRelease;
     bool directActive=false,directDisabled=false,preferDirect=true;
+    bool rtxBlocked=false,rtxPeak=true,gpuUsesRtx=false,rtxProbe=false;int rtxProbeFrames=0;QString rtxFallback;HdrEngine appliedEngine=HdrEngine::Auto;
     QString directFallback,processingError;QByteArray failedDescriptor;QMetaObject::Connection damageConnection;
     std::shared_ptr<desktop_metrics::State> presentation;
     QPointer<SurfaceInterface> observedSurface;
@@ -156,6 +162,31 @@ class TrueHDRDesktop : public Effect {
     bool processingEnabled()const{return hdrProcessing()||(sharpenEnabled()&&config["sharpen_intensity"].toInt()>0);}
     float sharpening()const{return sharpenEnabled()?config["sharpen_intensity"].toInt()/100.f:0.f;}
     bool watchdogActive()const{return !gpuBlocked&&!unloading&&selectedWindow&&processingEnabled();}
+    HdrEngine engine()const{return hdrEngine(config);}
+    QString rtxMarker()const{return root+"/output/desktop/rtx-start.pending";}
+    bool rtxWanted()const{auto choice=engine();return choice==HdrEngine::Rtx||(choice==HdrEngine::Auto&&!rtxBlocked&&rtxPeak);}
+    void rtxProbeBegin(){
+        QDir().mkpath(root+"/output/desktop");QFile file(rtxMarker());
+        if(file.open(QIODevice::WriteOnly)){file.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner);file.write("1");file.close();}
+        rtxProbe=true;rtxProbeFrames=0;
+    }
+    void rtxProbeEnd(){if(rtxProbe)QFile::remove(rtxMarker());rtxProbe=false;}
+    void blockRtx(const QString& reason){rtxBlocked=true;rtxFallback=reason;rtxProbeEnd();status(phase());}
+    void clearProcessingFailure(){
+        if(directDisabled||failed){retryCount=0;retryTimer.stop();directDisabled=false;failed=false;directFallback.clear();error.clear();}
+    }
+    void retryRtx(){
+        rtxBlocked=false;rtxFallback.clear();QFile::remove(rtxMarker());clearProcessingFailure();
+        updateDisplay();updateActivity();status(phase());effects->addRepaintFull();
+    }
+    bool rtxRuntimeFailure(const std::exception& failure){
+        if(engine()!=HdrEngine::Auto||!gpu||!gpu->rtxFailed())return false;
+        blockRtx(QString::fromUtf8(failure.what()));release();effects->addRepaintFull();return true;
+    }
+    const char* engineStatus()const{
+        if(!gpu||!hdrProcessing())return engine()==HdrEngine::Shader?"The shader engine will process this window.":engine()==HdrEngine::Rtx?"RTX HDR will process this window.":"RTX HDR will be tried first; the shader engine is the backup.";
+        return gpu->rtxActive()?"Using RTX HDR.":"Using the shader engine.";
+    }
     void repaintOverlay(){
         if(!controlsScreen)return;
         auto area=controlsScreen->geometry();
@@ -202,6 +233,7 @@ class TrueHDRDesktop : public Effect {
     }
     void updateDisplay(){
         auto previous=std::tuple(displayPeak,displayHdr,displayName);
+        if(engine()!=appliedEngine){appliedEngine=engine();clearProcessingFailure();effects->addRepaintFull();}
         auto* screen=selectedWindow?selectedWindow->screen():controlsScreen.data();
         if(!screen)screen=effects->screenAt(effects->cursorPos().toPoint());
         if(pictureScreen!=screen){
@@ -224,8 +256,10 @@ class TrueHDRDesktop : public Effect {
             auto state=testDisplays.value(displayName,{config["peak_brightness"].toInt(1500),true});peak=state.first;enabled=state.second;
         }
 #endif
-        displayPeak=PictureSettings::supportedPeak(peak);displayHdr=enabled&&displayPeak;
-        if(!displayHdr)displayError=backend&&backend->highDynamicRange()?"Display peak is outside the supported 400–2000 nit range.":"Enable HDR for this screen in KDE Display Settings to use HDR. Sharpening is still available.";
+        rtxPeak=PictureSettings::supportedPeak(peak)!=0;
+        displayPeak=engine()==HdrEngine::Rtx?PictureSettings::supportedPeak(peak):ShaderTone::supportedPeak(peak);displayHdr=enabled&&displayPeak;
+        if(!displayHdr)displayError=backend&&backend->highDynamicRange()?(engine()==HdrEngine::Rtx?"Display peak is outside the 400–2000 nit range RTX HDR supports. The Auto or Shader engine can use this display.":"Display peak is outside the supported 100–10000 nit range."):"Enable HDR for this screen in KDE Display Settings to use HDR. Sharpening is still available.";
+        else if(engine()==HdrEngine::Auto&&!rtxPeak)displayError="This display peak is outside RTX HDR's 400–2000 nit range, so the shader engine is used.";
         updateActivity();
         if(previous!=std::tuple(displayPeak,displayHdr,displayName)){hdrColor.reset();status(phase());effects->addRepaintFull();}
         else if(visible)repaintOverlay();
@@ -293,7 +327,7 @@ class TrueHDRDesktop : public Effect {
         }else if(retireAge.elapsed()>=1000)abandonGpu();
     }
     void release(){
-        queueWatch.stop();inputFbo.reset();source.reset();output.reset();dimensions={};directActive=false;
+        rtxProbeEnd();queueWatch.stop();inputFbo.reset();source.reset();output.reset();dimensions={};directActive=false;
         if(gpu){
             retiredGpu=std::make_unique<RetiredGPU>(RetiredGPU{std::move(gpu),std::move(inFlightBuffer),std::move(inFlightRelease)});
             retireAge.start();pollRetirement();if(retiredGpu)retireTimer.start(20);
@@ -315,7 +349,7 @@ class TrueHDRDesktop : public Effect {
         if constexpr(!development){
             profiles::write(root+"/output/desktop/live-status.json",{{"stage",stage},{"updated",QDateTime::currentSecsSinceEpoch()},
                 {"watchdog_active",watchdogActive()},{"enabled",processingEnabled()},{"hdr_enabled",hdrEnabled()},{"sharpen_enabled",sharpenEnabled()},{"overlay_visible",visible},
-                {"display_peak",displayPeak},{"display_hdr",displayHdr},{"display",displayName},{"direct_input",directActive},{"gpu_recovery_required",gpuBlocked},{"error",gpuBlocked?QString(recoveryMessage):error}},e);
+                {"display_peak",displayPeak},{"display_hdr",displayHdr},{"display",displayName},{"direct_input",directActive},{"hdr_engine",config["hdr_engine"].toString("auto")},{"rtx_active",gpu&&gpu->rtxActive()},{"rtx_fallback",rtxFallback},{"gpu_recovery_required",gpuBlocked},{"error",gpuBlocked?QString(recoveryMessage):error}},e);
             return;
         }
         profiles::write(root+"/output/desktop/live-status.json",{{"stage",stage},{"pid",QCoreApplication::applicationPid()},
@@ -328,6 +362,7 @@ class TrueHDRDesktop : public Effect {
             {"watchdog_active",watchdogActive()},{"settings_monitor","file-notifications"},
             {"enabled",processingEnabled()},{"hdr_enabled",hdrEnabled()},{"sharpen_enabled",sharpenEnabled()},{"overlay_visible",visible},{"error",error},{"width",dimensions.width()},{"height",dimensions.height()},
             {"display_peak",displayPeak},{"display_hdr",displayHdr},{"display",displayName},
+            {"hdr_engine",config["hdr_engine"].toString("auto")},{"rtx_active",gpu&&gpu->rtxActive()},{"rtx_fallback",rtxFallback},
             {"color_pipeline",colorAudit},
             {"source_buffer",bufferAudit},{"direct_input",directActive},{"direct_fallback",directFallback},
             {"input",inputAudit},{"controls",controlRects},
@@ -352,7 +387,7 @@ class TrueHDRDesktop : public Effect {
             auto* process=new QProcess(this);copyProcess=process;
             connect(process,qOverload<int,QProcess::ExitStatus>(&QProcess::finished),process,&QObject::deleteLater);
             auto env=QProcessEnvironment::systemEnvironment();env.insert("QT_QPA_PLATFORM","wayland");process->setProcessEnvironment(env);
-            process->start(QString::fromUtf8(TRUEHDR_ROOT)+"/build/truehdr-panel",{profile,"--clipboard-write"});
+            process->start(QString::fromUtf8(TRUEHDR_PANEL),{profile,"--clipboard-write"});
             process->write(text);process->closeWriteChannel();
         });
     }
@@ -360,7 +395,7 @@ class TrueHDRDesktop : public Effect {
         if(pasteProcess.state()!=QProcess::NotRunning||!ImGui::GetIO().WantTextInput)return;
         pasteField=ImGui::GetActiveID();
         auto env=QProcessEnvironment::systemEnvironment();env.insert("QT_QPA_PLATFORM","wayland");pasteProcess.setProcessEnvironment(env);
-        pasteProcess.start(QString::fromUtf8(TRUEHDR_ROOT)+"/build/truehdr-panel",{profile,"--clipboard-read"});pasteTimeout.start(2000);
+        pasteProcess.start(QString::fromUtf8(TRUEHDR_PANEL),{profile,"--clipboard-read"});pasteTimeout.start(2000);
     }
     Timing* beginTiming(){
         if(!development||!timingEnabled)return nullptr;
@@ -490,25 +525,80 @@ class TrueHDRDesktop : public Effect {
                 ImGui::Text("Display peak");ImGui::SameLine();ImGui::TextColored(chaos_ui::blue,"%d nits - Auto",displayPeak);
                 if(!displayError.isEmpty())chaos_ui::hint(uiFonts.small,displayError.toUtf8().constData());
                 chaos_ui::tooltip("Uses the HDR brightness set in KDE Display Settings. Chaos HDR follows that display setting automatically.");
-                auto slider=[&](const char* label,const char* key,int low,int high,int fallback,const char* format,const char* help){
-                    ImGui::Spacing();int value=config[key].toInt(fallback);
+                auto choice=[&](const char* label,const char* id,const char* key,const char* fallback,std::initializer_list<std::pair<const char*,const char*>> options,const char* help){
+                    ImGui::Spacing();chaos_ui::heading(uiFonts.bold,label);chaos_ui::tooltip(help);
+                    auto current=config[key].toString(fallback);const char* shown=fallback;
+                    for(const auto& option:options)if(current==option.first)shown=option.second;
+                    bool picked=false;ImGui::SetNextItemWidth(-1);
+                    if(ImGui::BeginCombo(id,shown)){
+                        for(const auto& option:options)if(ImGui::Selectable(option.second,current==option.first)){config[key]=option.first;picked=true;}
+                        ImGui::EndCombo();
+                    }
+                    item(key);chaos_ui::tooltip(help);return picked;
+                };
+                if(choice("Engine","##hdr_engine","hdr_engine","auto",{{"auto","Auto - RTX HDR, shader backup"},{"rtx","RTX HDR only"},{"shader","Shader only"}},"Auto uses RTX HDR and switches to the shader engine if RTX HDR cannot start or stops working. The shader engine has more controls and does not need NVIDIA.")){
+                    changed=true;updateDisplay();
+                }
+                chaos_ui::hint(uiFonts.small,engineStatus());
+                if(engine()==HdrEngine::Auto&&!rtxFallback.isEmpty()){
+                    chaos_ui::hint(uiFonts.small,rtxFallback.toUtf8().constData());
+                    if(chaos_ui::button("Retry RTX HDR",{-1,32}))retryRtx();
+                    item("retry_rtx");
+                }
+                auto slider=[&](const char* label,const char* key,int low,int high,int fallback,const char* format,const char* help,float divisor=0){
+                    ImGui::Spacing();int value=config[key].toInt(fallback);bool moved=false;
                     chaos_ui::heading(uiFonts.bold,label);chaos_ui::tooltip(help);
-                    char number[64];std::snprintf(number,sizeof(number),format,value);
+                    char number[64];
+                    if(divisor)std::snprintf(number,sizeof(number),format,value/divisor);else std::snprintf(number,sizeof(number),format,value);
                     ImGui::SameLine(std::max(0.f,ImGui::GetWindowContentRegionMax().x-ImGui::CalcTextSize(number).x-2));
                     ImGui::TextColored(chaos_ui::white,"%s",number);
                     auto id=std::string("##")+key;
-                    if(chaos_ui::slider(id.c_str(),value,low,high)){config[key]=value;changed=true;}item(key);
-                    chaos_ui::tooltip(help);
+                    if(chaos_ui::slider(id.c_str(),value,low,high)){config[key]=value;changed=true;moved=true;}item(key);
+                    chaos_ui::tooltip(help);return moved;
                 };
                 slider("Middle greys","middle_gray",10,100,50,"%d nits","Brightness of everyday tones, without changing the display peak.");
                 slider("Contrast","contrast",-100,100,0,"%d%%","Separation between bright and dark areas.");
                 slider("Saturation","saturation",-100,100,0,"%d%%","Colour intensity. Zero keeps the default balance.");
+                ImGui::Spacing();
+                if(engine()==HdrEngine::Shader)ImGui::SetNextItemOpen(true,ImGuiCond_Once);
+                bool shaderOpen=ImGui::CollapsingHeader("Shader engine tuning##shader_section");item("shader_section");
+                if(shaderOpen){
+                    chaos_ui::hint(uiFonts.small,"Applies whenever the shader engine draws. Middle greys, Contrast and Saturation above still apply.");
+                    ImGui::Spacing();chaos_ui::heading(uiFonts.bold,"Preset");
+                    auto presetId=config["shader_preset"].toString("standard");const char* presetName="Custom";
+                    for(const auto& preset:shaderPresets)if(presetId==preset.id)presetName=preset.label;
+                    ImGui::SetNextItemWidth(-1);
+                    if(ImGui::BeginCombo("##shader_preset",presetName)){
+                        for(const auto& preset:shaderPresets)if(ImGui::Selectable(preset.label,presetId==preset.id)){applyShaderPreset(config,preset);changed=true;}
+                        ImGui::EndCombo();
+                    }item("shader_preset");
+                    bool edited=choice("Tone curve","##shader_curve","shader_curve","bt2446a",{{"bt2446a","BT.2446 Method A"},{"power","Highlight boost"}},"BT.2446 Method A follows the ITU SDR-to-HDR expansion and reaches the display peak on white. Highlight boost keeps SDR tones and lifts only the brightest part of the picture.");
+                    if(slider("Peak output","shader_peak",25,100,100,"%d%%","Highest brightness the shader engine may use, as a share of the display peak."))edited=true;
+                    if(slider("Exposure","shader_exposure",-200,200,0,"%+.2f EV","Scales the SDR picture before tone mapping, in photographic stops.",100))edited=true;
+                    if(slider("Colour boost","shader_saturation",-100,100,10,"%+d%%","Extra colour intensity in Oklab, applied together with Saturation."))edited=true;
+                    if(config["shader_curve"].toString("bt2446a")=="power"){
+                        if(slider("Highlight start","shader_highlight_start",30,95,75,"%d%%","SDR signal level where the highlight boost begins."))edited=true;
+                        if(slider("Highlight gain","shader_highlight_gain",0,500,100,"%+.2f EV","Brightness added at SDR white, in stops. Output is still limited by Peak output.",100))edited=true;
+                    }
+                    if(slider("Shadow start","shader_shadow_start",0,50,15,"%d%%","SDR signal level below which Shadow depth applies."))edited=true;
+                    if(slider("Shadow depth","shader_shadow_crush",0,100,0,"%d%%","Darkens tones under Shadow start. Zero leaves them unchanged."))edited=true;
+                    if(edited)config["shader_preset"]="custom";
+                }
+                ImGui::EndDisabled();ImGui::Spacing();ImGui::Separator();ImGui::Spacing();
+                chaos_ui::heading(uiFonts.bold,"Debanding");ImGui::SameLine(ImGui::GetWindowContentRegionMax().x-42);
+                bool deband=config["debanding"].toBool(true);if(chaos_ui::toggle("##debanding",deband)){config["debanding"]=deband;changed=true;}item("debanding");chaos_ui::tooltip("Smooths visible gradient steps. RTX HDR uses NVIDIA's debanding; the shader engine uses an adaptive filter.");
+                ImGui::BeginDisabled(!deband);
+                slider("Filter strength","deband_strength",0,100,30,"%d%%","Strength of the adaptive filter. Higher values smooth wider bands and can soften faint texture.");
+                bool beforeRtx=config["deband_before_rtx"].toBool(false);
+                if(ImGui::Checkbox("Also filter before RTX HDR",&beforeRtx)){config["deband_before_rtx"]=beforeRtx;changed=true;}item("deband_before_rtx");chaos_ui::tooltip("Runs the adaptive filter on the SDR picture in addition to NVIDIA's debanding. It costs extra GPU time.");
                 ImGui::EndDisabled();ImGui::Spacing();ImGui::Separator();ImGui::Spacing();
                 chaos_ui::heading(uiFonts.bold,"Sharpening");ImGui::SameLine(ImGui::GetWindowContentRegionMax().x-42);
                 bool sharp=sharpenEnabled();if(chaos_ui::toggle("##sharpen_enabled",sharp)){config["sharpen_enabled"]=sharp;if(sharp)config["enabled"]=true;changed=true;}item("sharpen_enabled");chaos_ui::tooltip("Enhance detail independently of HDR. Turning this off keeps your saved intensity.");
                 ImGui::BeginDisabled(!sharp);
                 slider("Intensity","sharpen_intensity",0,100,0,"%d%%","Enhances fine edges. Zero turns sharpening off.");
                 slider("Ignore film grain","ignore_film_grain",0,100,0,"%d%%","Reduces sharpening of grain and small texture variations.");
+                bool adaptive=config["sharpen_adaptive"].toBool(false);
+                if(ImGui::Checkbox("Edge-aware sharpening",&adaptive)){config["sharpen_adaptive"]=adaptive;changed=true;}item("sharpen_adaptive");chaos_ui::tooltip("Sharpens real edges only, leaving noise and smooth gradients alone and limiting halos.");
                 ImGui::EndDisabled();
                 ImGui::Spacing();
                 if(!error.isEmpty())ImGui::TextWrapped("%s",error.toUtf8().constData());
@@ -516,13 +606,13 @@ class TrueHDRDesktop : public Effect {
             ImGui::Separator();
             bool updateAvailable=releaseStatus["available"].isObject();
             if(chaos_ui::button(updateAvailable?"Update available":"Updates & repair",{ImGui::GetContentRegionAvail().x-80,34},updateAvailable)){
-                setVisible(false);QProcess::startDetached(QString::fromUtf8(TRUEHDR_ROOT)+"/build/truehdr-panel",{profile,"--updates"});
+                setVisible(false);QProcess::startDetached(QString::fromUtf8(TRUEHDR_PANEL),{profile,"--updates"});
             }item("updates");
             ImGui::SameLine();if(chaos_ui::button("More",{-1,34}))ImGui::OpenPopup("More options");
             if(ImGui::BeginPopup("More options")){
                 bool reduced=config["reduced_motion"].toBool();
                 if(ImGui::Checkbox("Reduce motion",&reduced)){config["reduced_motion"]=reduced;changed=true;}
-                if(ImGui::MenuItem("Accessible controls")){setVisible(false);QProcess::startDetached(QString::fromUtf8(TRUEHDR_ROOT)+"/build/truehdr-panel",{profile,"--accessible"});}
+                if(ImGui::MenuItem("Accessible controls")){setVisible(false);QProcess::startDetached(QString::fromUtf8(TRUEHDR_PANEL),{profile,"--accessible"});}
                 ImGui::EndPopup();
             }
             ImGui::PushFont(uiFonts.small);ImGui::TextColored(chaos_ui::muted,"Settings save automatically");ImGui::SameLine();ImGui::TextColored(chaos_ui::blue,"Alt+Z to close");ImGui::PopFont();
@@ -625,7 +715,8 @@ public:
         if(development&&!qEnvironmentVariableIsEmpty("TRUEHDR_DESKTOP_TEST_CLASS"))targetClass=qEnvironmentVariable("TRUEHDR_DESKTOP_TEST_CLASS");
         fixtureCapture=development&&!qEnvironmentVariableIsEmpty("TRUEHDR_DESKTOP_TEST_ROOT")&&qEnvironmentVariableIsSet("TRUEHDR_DESKTOP_TEST_CAPTURE");
         legacyAllowed=development;
-        QFile targets(root+"/window-targets.json");
+        if(QFile::exists(rtxMarker())){rtxBlocked=true;rtxFallback="RTX HDR did not finish starting last time, so the shader engine is in use.";}
+        QDir().mkpath(root);QFile targets(root+"/window-targets.json");
         if(targets.open(QIODevice::ReadOnly)){
             auto saved=QJsonDocument::fromJson(targets.readAll()).object();legacyAllowed=saved["legacy_ffxiv"].toBool(development);
             for(const auto& value:saved["classes"].toArray())if(value.isString()&&!value.toString().trimmed().isEmpty())rememberedClasses.append(value.toString());
@@ -755,16 +846,20 @@ public:
                 return effects->drawWindow(targetBuffer,viewport,window,mask,region,data);
             }
             if(direct)directFallback.clear();
-            if(size!=dimensions||direct!=directActive){
+            const bool wantRtx=rtxWanted();
+            if(size!=dimensions||direct!=directActive||wantRtx!=gpuUsesRtx){
                 release();if(retiredGpu||gpuBlocked)return effects->drawWindow(targetBuffer,viewport,window,mask,region,data);
-                try{gpu=std::make_unique<DesktopGPU>(size.width(),size.height(),direct);}
+                const auto rtxMode=engine()==HdrEngine::Rtx?DesktopGPU::RtxMode::Required:wantRtx?DesktopGPU::RtxMode::Preferred:DesktopGPU::RtxMode::Off;
+                if(wantRtx)rtxProbeBegin();
+                try{gpu=std::make_unique<DesktopGPU>(size.width(),size.height(),direct,rtxMode);}
                 catch(const std::exception& e){if(!direct)throw;processingFailure(QString::fromUtf8(e.what()));
                     if(!fixtureCapture){release();return effects->drawWindow(targetBuffer,viewport,window,mask,region,data);}
-                    direct=false;gpu=std::make_unique<DesktopGPU>(size.width(),size.height());}
+                    direct=false;gpu=std::make_unique<DesktopGPU>(size.width(),size.height(),false,rtxMode);}
 #ifdef TRUEHDR_DEVELOPMENT
                 ++gpuCreations;
 #endif
-                dimensions=size;directActive=direct;
+                dimensions=size;directActive=direct;gpuUsesRtx=gpu->rtxActive();
+                if(wantRtx&&!gpuUsesRtx)blockRtx(QString::fromUtf8(gpu->rtxError()));
                 if(!direct)source=GLTexture::createNonOwningWrapper(gpu->inputTexture(),GL_RGBA8,size);
                 output=GLTexture::createNonOwningWrapper(gpu->outputTexture(),GL_RGB10_A2,size);
                 if(direct)output->setContentTransform(OutputTransform::FlipY);
@@ -787,12 +882,13 @@ public:
                 return effects->drawWindow(targetBuffer, viewport, window, mask, region, data);
             }
             if(queueWatch.isActive())queueWatch.stop();
+            if(rtxProbe&&hdrProcessing()&&++rtxProbeFrames>3)rtxProbeEnd();
             DesktopGPU::DmaInput input;
             if(direct){
                 input.width=dma->width;input.height=dma->height;input.format=dma->format;input.planes=dma->planeCount;input.modifier=dma->modifier;input.pitch=dma->pitch;input.offset=dma->offset;input.acquireFd=surface->syncFd().get();
                 for(int n=0;n<dma->planeCount;++n)input.fd[n]=dma->fd[n].get();
             }
-            gpu->setSettings(PictureSettings::from(config,displayPeak));
+            gpu->setSettings(PictureSettings::from(config,displayPeak));gpu->setTone(ShaderTone::from(config,displayPeak));
             auto timing=beginTiming();
             if(direct){
                 if(timing)glQueryCounterEXT(timing->queries[1],GL_TIMESTAMP_EXT);
@@ -804,7 +900,9 @@ public:
                     auto wayland=qobject_cast<SurfaceItemWayland*>(surface);
                     inFlightRelease=wayland&&wayland->surface()?wayland->surface()->bufferReleasePoint():nullptr;
                     gpu->convertDirect(input,sharpening(),config["ignore_film_grain"].toInt()/100.f,timingEnabled,hdrProcessing());}
-                catch(const std::exception& e){processingFailure(QString::fromUtf8(e.what()));release();return drawWindow(targetBuffer,viewport,window,mask,region,data);}
+                catch(const std::exception& e){
+                    if(rtxRuntimeFailure(e))return effects->drawWindow(targetBuffer,viewport,window,mask,region,data);
+                    processingFailure(QString::fromUtf8(e.what()));release();return drawWindow(targetBuffer,viewport,window,mask,region,data);}
 
 
 
@@ -867,7 +965,9 @@ public:
                 (convertFinished-convertStarted)/1e6,previous.lastPrepare,previous.lastEngine,previous.lastTotal,previous.samples});}
             if(statusTimer.elapsed()>1000){status("filtering");statusTimer.restart();}
             return true;
-        }catch(const std::exception& e){renderingInput=false;processingFailure(QString::fromUtf8(e.what()));release();failed=true;status("error");
+        }catch(const std::exception& e){renderingInput=false;
+            if(rtxRuntimeFailure(e))return effects->drawWindow(targetBuffer,viewport,window,mask,region,data);
+            processingFailure(QString::fromUtf8(e.what()));release();failed=true;status("error");
             return effects->drawWindow(targetBuffer,viewport,window,mask,region,data);}
     }
     bool paintScreen(const RenderTarget& targetBuffer,const RenderViewport& viewport,int mask,const Region& region,LogicalOutput* screen)override{
@@ -1016,6 +1116,7 @@ public Q_SLOTS:
         return "{}";
     }
     bool ping(){return true;}
+    void retryRtxEngine(){retryRtx();}
     QString applications(){
         QJsonArray result;for(auto* window:effects->stackingOrder())if(applicationWindow(window))
             result.append(QJsonObject{{"id",window->window()->internalId().toString()},{"title",window->caption()}});

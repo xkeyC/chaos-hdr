@@ -10,7 +10,8 @@ class DesktopGPU {
     struct Impl;
     std::unique_ptr<Impl> impl;
 public:
-    DesktopGPU(uint32_t width, uint32_t height,bool direct=false);
+    enum class RtxMode {Off,Preferred,Required};
+    DesktopGPU(uint32_t width, uint32_t height,bool direct=false,RtxMode rtx=RtxMode::Required);
     ~DesktopGPU();
     unsigned inputTexture() const;
     unsigned outputTexture() const;
@@ -23,6 +24,10 @@ public:
     void testCompletion(int mode);
 #endif
     void setSettings(const PictureSettings& settings);
+    void setTone(const ShaderTone& tone);
+    bool rtxActive() const;
+    bool rtxFailed() const;
+    const char* rtxError() const;
     void convert(float sharpen, float ignoreGrain,bool timing=false,bool hdr=true);
     struct DmaInput {
         uint32_t width{},height{},format{},planes{};

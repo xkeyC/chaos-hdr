@@ -24,11 +24,13 @@ Application rendering
   -> KWin window draw hook
   -> direct DMA-BUF import into Vulkan
   -> fused sharpening/input preparation
-  -> NVIDIA TrueHDR with debanding
+  -> NVIDIA TrueHDR with debanding, or the shader HDR engine in the same compute pass
   -> shared 10-bit PQ HDR output
   -> KWin color-managed composition
   -> display
 ```
+
+The shader engine writes the same BT.2020 PQ output as TrueHDR, so KWin composes both identically. Engine selection, fallback triggers and the startup marker are described in [development notes](../Chaos%20HDR%20development.md#050-shader-hdr-fallback).
 
 Importing shared GPU memory does not render the game again. Input and HDR output resources are still necessary, as are synchronization and buffer-lifetime protection. Normal production operation has no CPU frame readback or frame-file recording.
 

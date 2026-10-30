@@ -18,7 +18,7 @@
 
 **Desktop testing has been limited to an existing CachyOS installation with KDE
 Plasma Wayland. Other distributions and desktops, including GNOME, are untested
-for installation and runtime use.** The current integration depends on KDE/KWin.
+for installation and runtime use.** The current integration depends on KDE/KWin. [NixOS](#nixos) is built from this repository's flake and has been used on one machine.
 The installer's CachyOS/Arch package support does not establish validation on
 other Arch-based systems or compatibility with another desktop environment.
 
@@ -35,9 +35,10 @@ The installer does not replace the GPU driver. Other distributions, desktop envi
 The public installer builds the same production direct-buffer KWin effect used
 on the development CachyOS installation. It includes NVIDIA TrueHDR, debanding,
 the full sharpening range, Alt+Z application approval and controls, named picture
-profiles, event-driven startup and the active-target watchdog. It does not
-substitute a shader approximation, separate preview, capture fallback or
-game-injected version. NVIDIA's runtime and SDK downloads are pinned by the
+profiles, event-driven startup and the active-target watchdog. RTX HDR stays the
+default; the shader engine is only used as its fallback or when you choose it.
+It does not substitute a separate preview, capture fallback or game-injected
+version. NVIDIA's runtime and SDK downloads are pinned by the
 installer; native components are built against the recipient's installed KWin.
 
 Personal profiles, app approvals and development captures are not distributed.
@@ -78,6 +79,34 @@ bash Chaos-HDR-CachyOS.run
 It extracts reviewed source, reuses or creates the project-local dependency environment, obtains pinned NVIDIA components, builds the native effect and shortcut/controller helpers, and registers login startup. Existing picture profiles and app approvals are preserved. There are no game-folder copies or per-game launch flags.
 
 The [latest GitHub release](https://github.com/chaosfox26/chaos-hdr/releases/latest) also provides source and installer downloads for inspection. Choose a specific release's assets when you need a fixed older version. Integrity checking is available with `bash Chaos-HDR-CachyOS.run --check`.
+
+## NixOS
+
+The repository is a flake. Its module builds the effect against the system's own
+`kdePackages.kwin`, so a KWin update rebuilds the effect instead of needing the
+recovery flow, and the Python installer and updater are not used.
+
+```nix
+# flake.nix
+inputs.chaos-hdr = {
+  url = "github:xkeyC/chaos-hdr";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+
+# configuration
+imports = [ inputs.chaos-hdr.nixosModules.default ];
+nixpkgs.config.allowUnfree = true;
+programs.chaos-hdr.enable = true;
+```
+
+The package includes NVIDIA's proprietary NGX loader and TrueHDR runtime, so it
+needs `allowUnfree`. After the switch, sign out and back in. Data is kept in
+`$XDG_DATA_HOME/chaos-hdr`. The effect is loaded for the session and never written
+to `kwinrc`, so a crash does not repeat at the next KWin start. Remove it by
+disabling the option; **Updates & repair** does not apply to this installation.
+
+Outside NixOS use `nix build`, and `nix flake check` for the native tests. Standalone
+GPU check: `result/libexec/chaos-hdr/truehdr-desktop-gpu-test <dir> 0 0 x hdr auto`.
 
 ## Release acceptance
 

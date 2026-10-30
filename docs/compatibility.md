@@ -43,6 +43,10 @@ Chaos HDR processes the window buffer delivered to KWin. It does not add a separ
 
 Sources for translation routes: [DXVK](https://github.com/doitsujin/dxvk) and [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton). Other Wine configurations can use different routes.
 
+## HDR engine requirements
+
+RTX HDR needs an NVIDIA GPU, the NGX runtime and a display peak of 400–2,000 nits. The shader engine needs Vulkan and OpenGL memory and semaphore interop on the GPU KWin renders with, and a display peak of 100–10,000 nits. Its GPU path passed an isolated check on an AMD Raphael iGPU, but running it inside KWin on a non-NVIDIA GPU has not been tested.
+
 ## Current fast-path requirements
 
 - A selectable application window with a suitable GPU-backed DMA-BUF.

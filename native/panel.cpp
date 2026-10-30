@@ -75,7 +75,14 @@ int main(int argc,char** argv) {
     QDBusInterface effect("org.kde.KWin","/TrueHDR","org.truehdr.Desktop");effect.setTimeout(1000);
     QDBusReply<bool> ready=effect.call("ping");
     if(!ready.isValid()||!ready.value()){app.setQuitOnLastWindowClosed(true);showRecovery();return app.exec();}
+#ifdef TRUEHDR_SYSTEM_PACKAGE
+    QSaveFile toggleFile(root+"/overlay.toggle");
+    if(!toggleFile.open(QIODevice::WriteOnly))return 1;
+    toggleFile.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner);toggleFile.write(QByteArray::number(QDateTime::currentMSecsSinceEpoch()));
+    return toggleFile.commit()?0:1;
+#else
     return QProcess::startDetached(root+"/.venv/bin/python",{root+"/desktop.py","--controls"})?0:1;
+#endif
 #else
     if(!app.arguments().contains("--preview-controls") && !app.arguments().contains("--test-screenshot")){
         return QProcess::startDetached(root+"/.venv/bin/python",{root+"/desktop.py","--controls"})?0:1;

@@ -3,8 +3,74 @@ layout(local_size_x=16,local_size_y=16) in;
 layout(binding=0) uniform sampler2D source;
 layout(rgba8ui,binding=1) writeonly uniform uimage2D destination;
 layout(rgb10_a2,binding=2) writeonly uniform image2D sdrDestination;
-layout(push_constant) uniform Settings { uint width,height;float intensity,grain;uint hdr; } config;
+layout(push_constant) uniform Settings {
+    uint width,height;float intensity,grain;uint mode,flags;
+    float deband,exposure,peak,middle,midGamma,contrast,saturation,pHdr;
+    float highlightStart,highlightGain,shadowStart,shadowPower,knee,slope,top;uint power;
+} config;
+const uint modeRtx=0,modeSdr=1,modeShader=2;
+const uint flagAdaptive=1,flagDeband=2;
+const float pSdr=5.696958;
+const vec3 lumaWeights=vec3(.2126,.7152,.0722);
 shared vec3 tile[324];
+vec3 fetched(ivec2 p){return texelFetch(source,clamp(p,ivec2(0),ivec2(config.width,config.height)-ivec2(1)),0).rgb;}
+vec3 ring(ivec2 center,int radius,out float spread){
+    const ivec2 offsets[8]=ivec2[8](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1),ivec2(1,1),ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1));
+    vec3 samples[8],sum=vec3(0);
+    for(int n=0;n<8;++n){samples[n]=fetched(center+offsets[n]*radius);sum+=samples[n];}
+    sum*=.125;spread=0;
+    for(int n=0;n<8;++n){vec3 d=abs(samples[n]-sum);spread+=d.r+d.g+d.b;}
+    spread*=.125;return sum;
+}
+vec3 debanded(ivec2 pos,vec3 center){
+    float nearSpread,middleSpread,farSpread,t=config.deband;
+    vec3 near=ring(pos,4,nearSpread),middle=ring(pos,12,middleSpread),far=ring(pos,28,farSpread);
+    float textured=smoothstep(t*.5,t*3,max(nearSpread,middleSpread));
+    float plain=1-smoothstep(t*.5,t*2.5,farSpread);
+    return mix(center,near*.25+middle*.45+far*.3,plain*(1-textured));
+}
+float dither(ivec2 pos){return fract(52.9829189*fract(dot(vec2(pos),vec2(.06711056,.00583715))))-.5;}
+vec3 decoded(vec3 c){return mix(c/12.92,pow((c+.055)/1.055,vec3(2.4)),step(vec3(.04045),c));}
+float signalOf(float linear){
+    float s=pow(clamp(linear,0,1),1/2.4);
+    return s<config.shadowStart?config.shadowStart*pow(s/config.shadowStart,config.shadowPower):s;
+}
+float expanded(float s){
+    if(config.power!=0){
+        float x=clamp((s-config.highlightStart)/max(1-config.highlightStart,.001),0,1);x=x*x*(3-2*x);
+        return config.middle/.18*pow(s,2.4)*(1+(config.highlightGain-1)*x);
+    }
+    float c=log(1+(pSdr-1)*s)/log(pSdr);
+    float p=c<=.7735?c/1.077:min((2.7811-sqrt(max(2.7811*2.7811-4*1.151*(.6302+c),0)))/(2*1.151),1);
+    float h=(exp(p*log(config.pHdr))-1)/(config.pHdr-1);
+    return config.peak*pow(pow(h,2.4),config.midGamma);
+}
+float shaped(float nits){
+    nits=config.middle*pow(nits/config.middle,config.contrast);
+    if(config.slope>1&&nits>config.knee){
+        float x=min((nits-config.knee)/(config.top-config.knee),1);
+        nits=config.knee+(config.peak-config.knee)*config.slope*x/(1+(config.slope-1)*x);
+    }
+    return nits;
+}
+vec3 oklabSaturated(vec3 c){
+    vec3 lms=pow(max(mat3(.4122214708,.2119034982,.0883024619,.5363325363,.6806995451,.2817188376,.0514459929,.1073969566,.6299787005)*(c/10000),vec3(1e-9)),vec3(1.0/3.0));
+    vec3 lab=mat3(.2104542553,1.9779984951,.0259040371,.793617785,-2.428592205,.7827717662,-.0040720468,.4505937099,-.808675766)*lms;
+    lab.yz*=config.saturation;
+    lms=mat3(1,1,1,.3963377774,-.1055613458,-.0894841775,.2158037573,-.0638541728,-1.291485548)*lab;
+    return mat3(4.0767416621,-1.2684380046,-.0041960863,-3.3077115913,2.6097574011,-.7034186147,.2309699292,-.3413193965,1.707614701)*(lms*lms*lms)*10000;
+}
+vec3 perceptualQuantized(vec3 nits){
+    vec3 v=pow(clamp(nits/10000,vec3(0),vec3(1)),vec3(.1593017578125));
+    return pow((.8359375+18.8515625*v)/(1+18.6875*v),vec3(78.84375));
+}
+vec3 hdrSignal(vec3 encoded){
+    vec3 linear=decoded(encoded)*config.exposure;
+    float y=dot(linear,lumaWeights);
+    linear*=y>1e-5?shaped(expanded(signalOf(y)))/y:0;
+    if(abs(config.saturation-1)>.001)linear=oklabSaturated(linear);
+    return perceptualQuantized(mat3(.6274,.0691,.0164,.3293,.9195,.088,.0433,.0114,.8956)*linear);
+}
 void main(){
     uvec2 pos=gl_GlobalInvocationID.xy;
     if(config.intensity>0){
@@ -17,20 +83,37 @@ void main(){
     }
     if(pos.x>=config.width||pos.y>=config.height)return;
     vec3 rgb=config.intensity>0?tile[(gl_LocalInvocationID.y+1)*18+gl_LocalInvocationID.x+1]:texelFetch(source,ivec2(pos),0).rgb;
+    bool deband=(config.flags&flagDeband)!=0;
+    if(deband)rgb=debanded(ivec2(pos),rgb);
     if(config.intensity>0){
-        vec3 sum=vec3(0);float count=0;
+        vec3 sum=vec3(0);float count=0,lumaLow=2,lumaHigh=-1;
         for(int y=-1;y<=1;++y)for(int x=-1;x<=1;++x){
             ivec2 p=ivec2(pos)+ivec2(x,y);
             if(p.x>=0&&p.y>=0&&p.x<int(config.width)&&p.y<int(config.height)){
                 ivec2 local=ivec2(gl_LocalInvocationID.xy)+ivec2(x,y)+ivec2(1);
-                sum+=tile[local.y*18+local.x];count+=1;
+                vec3 sampled=tile[local.y*18+local.x];
+                sum+=sampled;count+=1;
+                float luma=dot(sampled,lumaWeights);lumaLow=min(lumaLow,luma);lumaHigh=max(lumaHigh,luma);
             }
         }
         vec3 detail=rgb-sum/count;
         detail=sign(detail)*max(abs(detail)-config.grain*(8.0/255.0),vec3(0));
-        rgb=clamp(rgb+clamp(detail,vec3(-0.05),vec3(0.05))*config.intensity,vec3(0),vec3(1));
+        if((config.flags&flagAdaptive)!=0){
+            ivec2 center=ivec2(pos);float luma=dot(rgb,lumaWeights);
+            float distant=(dot(fetched(center+ivec2(16,0)),lumaWeights)+dot(fetched(center-ivec2(16,0)),lumaWeights)+dot(fetched(center+ivec2(0,16)),lumaWeights)+dot(fetched(center-ivec2(0,16)),lumaWeights))*.25;
+            float mask=smoothstep(.004,.03,lumaHigh-lumaLow)*smoothstep(.015,.05,abs(luma-distant));
+            vec3 sharpened=rgb+detail*config.intensity*mask;
+            float range=(lumaHigh-lumaLow)*.25,result=max(dot(sharpened,lumaWeights),1e-6);
+            rgb=clamp(sharpened*clamp(result,lumaLow-range,lumaHigh+range)/result,vec3(0),vec3(1));
+        }else rgb=clamp(rgb+clamp(detail,vec3(-0.05),vec3(0.05))*config.intensity,vec3(0),vec3(1));
     }
-    if(config.hdr==0){imageStore(sdrDestination,ivec2(pos),vec4(rgb,1));return;}
+    if(config.mode==modeSdr){imageStore(sdrDestination,ivec2(pos),vec4(rgb,1));return;}
+    if(config.mode==modeShader){
+        vec3 signal=hdrSignal(rgb);
+        if(deband)signal=clamp(signal+dither(ivec2(pos))/1023,vec3(0),vec3(1));
+        imageStore(sdrDestination,ivec2(pos),vec4(signal,1));return;
+    }
+    if(deband)rgb=clamp(rgb+dither(ivec2(pos))/255,vec3(0),vec3(1));
     uint packed=packUnorm4x8(vec4(rgb,1));
     imageStore(destination,ivec2(pos),uvec4(packed&255,(packed>>8)&255,(packed>>16)&255,packed>>24));
 }

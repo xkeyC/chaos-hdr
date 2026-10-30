@@ -58,6 +58,7 @@ title effects are animated.
 
 - NVIDIA TrueHDR conversion with debanding, plus adjustable sharpening.
 - Live Alt+Z controls, automatic KDE display-peak detection and named picture profiles.
+- A shader HDR engine that takes over when RTX HDR cannot start or stops working, with its own tone curves, presets and tuning controls.
 - Explicit application approval without executable browsing; one selected window is processed at a time.
 - Direct submitted GPU-buffer processing inside KWin, outside the application process.
 - Event-driven idle operation and a watchdog only while a target has HDR enabled.
@@ -90,6 +91,16 @@ The **0.4.3** follow-up measured **0.269 ms** median GPU processing in the live
 with Vulkan validation enabled, both with the sidebar closed. Settings and test
 conditions differ between those runs and the historical table. The matched
 baseline comparisons showed no material regression. See the [0.4.3 results](docs/releases/0.4.3.md).
+
+## 0.5.0 — shader HDR fallback
+
+Adds a second HDR engine beside NVIDIA TrueHDR. **Auto** uses RTX HDR and switches to
+the shader engine if RTX HDR cannot start, fails while running, or did not finish
+starting during the previous session. **RTX HDR only** and **Shader only** are also
+available. The shader engine does not need NGX or an NVIDIA GPU and accepts display
+peaks outside TrueHDR's 400–2,000 nit range. It does not reproduce NVIDIA's model.
+The shader HDR engine was inspired by [this Bilibili video](https://www.bilibili.com/video/BV1uvph6FEnz).
+See the [0.5.0 notes](docs/releases/0.5.0.md) and the [user guide](docs/user-guide.md#hdr-engines).
 
 ## 0.4.4 — fresh HDR frames
 

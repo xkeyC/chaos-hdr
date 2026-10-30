@@ -19,12 +19,18 @@
 int main(int argc,char** argv){
     QSurfaceFormat format;format.setRenderableType(QSurfaceFormat::OpenGLES);format.setVersion(3,2);QSurfaceFormat::setDefaultFormat(format);
     QGuiApplication app(argc,argv);
-    if(argc<2||argc>6)return 2;
+    if(argc<2||argc>8)return 2;
     float strength=argc>2?std::strtof(argv[2],nullptr)/100.f:.5f;
     float grain=argc>3?std::strtof(argv[3],nullptr)/100.f:0.f;
     bool grainPattern=argc>4&&std::string(argv[4])=="grain";
     bool hdr=argc<6||std::string(argv[5])!="sdr";
     QString directory=QString::fromLocal8Bit(argv[1]);QDir().mkpath(directory);
+    std::string engineName=argc>6?argv[6]:"rtx";
+    auto rtxMode=engineName=="shader"?DesktopGPU::RtxMode::Off:engineName=="auto"?DesktopGPU::RtxMode::Preferred:DesktopGPU::RtxMode::Required;
+    QJsonObject picture;
+    if(argc>7){QFile settings(QString::fromLocal8Bit(argv[7]));if(!settings.open(QIODevice::ReadOnly))return 2;picture=QJsonDocument::fromJson(settings.readAll()).object();}
+    constexpr int displayPeak=1000;
+    auto tone=ShaderTone::from(picture,displayPeak);
     try{
         QOpenGLContext context;context.setFormat(format);if(!context.create())throw std::runtime_error("Create test OpenGL context");
         QOffscreenSurface surface;surface.setFormat(context.format());surface.create();if(!context.makeCurrent(&surface))throw std::runtime_error("Make test context current");
@@ -38,7 +44,9 @@ int main(int argc,char** argv){
             input[i]=input[i+1]=input[i+2]=value;input[i+3]=255;
         }
         {
-            DesktopGPU engine(width,height);
+            DesktopGPU engine(width,height,false,rtxMode);
+            engine.setSettings(PictureSettings::from(picture,displayPeak));engine.setTone(tone);
+            std::printf("HDR engine: %s%s%s\n",engine.rtxActive()?"RTX HDR":"shader",*engine.rtxError()?" - ":"",engine.rtxError());
             glBindTexture(GL_TEXTURE_2D,engine.inputTexture());glTexSubImage2D(GL_TEXTURE_2D,0,0,0,width,height,GL_RGBA,GL_UNSIGNED_BYTE,input.data());glBindTexture(GL_TEXTURE_2D,0);
             for(int n=0;n<3;++n)engine.convert(strength,grain,false,hdr);
             GLuint fbo;glGenFramebuffers(1,&fbo);glBindFramebuffer(GL_FRAMEBUFFER,fbo);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,engine.outputTexture(),0);
@@ -60,6 +68,19 @@ int main(int argc,char** argv){
                 }
                 if(maximum>2)throw std::runtime_error("Sharpen-only SDR output differs from the reference: "+std::to_string(maximum));
                 std::printf("SDR-only output verified against every source pixel; maximum 10-bit difference: %d\n",maximum);
+            }
+            if(hdr&&!engine.rtxActive()&&strength==0&&!tone.debanding){
+                int maximum=0;
+                for(int y=0;y<height;y+=3)for(int x=0;x<width;x+=3){
+                    const auto* in=&input[4*(y*width+x)];
+                    auto expected=tone.encoded(in[0]/255.f,in[1]/255.f,in[2]/255.f);
+                    for(int channel=0;channel<3;++channel){
+                        int actual=(pixels[y*width+x]>>(channel*10))&1023;
+                        maximum=std::max(maximum,std::abs(actual-int(std::lround(expected[channel]*1023))));
+                    }
+                }
+                if(maximum>3)throw std::runtime_error("Shader HDR output differs from the reference: "+std::to_string(maximum));
+                std::printf("Shader HDR output verified against the reference; maximum 10-bit difference: %d\n",maximum);
             }
             QFile source(directory+"/input.rgba8"),out(directory+"/output.rgb10a2");
             if(!source.open(QIODevice::WriteOnly)||!out.open(QIODevice::WriteOnly))throw std::runtime_error("Write test captures");

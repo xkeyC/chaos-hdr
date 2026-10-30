@@ -1866,3 +1866,82 @@ The production build keeps detailed timing, input fixtures and frame readback
 disabled. Temporary numeric measurement variants, recorders, sampling services
 and private traces stay outside the public source allowlist. See the
 [release measurements and limits](docs/releases/0.4.4.md).
+
+## 0.5.0 shader HDR fallback
+
+`DesktopGPU` takes an `RtxMode`: `Off` never creates NGX, `Required` keeps the
+historical behavior of throwing, and `Preferred` catches NGX creation failures and
+continues without an engine. In `Preferred` the vendor check and the NVX device
+extensions become optional. A failed creation may have recorded partial NGX
+commands, so the command buffer is reset and the layout barriers are recorded again.
+
+`input.comp` selects its output through `mode`: 0 prepares RTX input, 1 writes SDR
+directly, 2 writes the shader engine's PQ signal to the same image TrueHDR would.
+The effect presents that image with the unchanged BT.2020 PQ description, so nothing
+downstream distinguishes the engines. Push constants stay below Vulkan's guaranteed
+128 bytes.
+
+Fallback triggers, all in `effect.cpp`: `rtxError()` after creation, `rtxFailed()`
+when evaluation throws while recording, `rtxPeak` for peaks TrueHDR rejects, and
+`rtx-start.pending`. NGX has crashed KWin outright before (see the NVML note in
+packaging), which no `catch` can observe. The marker is written before NGX creation
+and removed after three evaluated frames or a normal release. If it exists when the
+effect loads, Auto stays on the shader until Retry RTX HDR removes it. A logout in
+that short window gives a false positive, which is visible and recoverable.
+
+Tone mapping works on luminance in display-referred nits, with the chromaticity held
+by a common gain, then applies Oklab saturation and converts to BT.2020 PQ.
+
+- The BT.2446 Method A inverse includes the standard's `pSDR` stage. ITU's forward
+  pieces do not quite meet: inverting them at the published boundaries (0.7969 and
+  0.99545) makes the output step backwards by about 0.0004. The linear piece
+  therefore hands over at 0.7735, where the two pieces actually cross, and the
+  quadratic piece runs to 1, which avoids the upper seam.
+- Middle greys stays meaningful: the BT.2446 result is raised to `midGamma`, solved
+  so 18% grey lands on the slider's nits while white stays at peak. Highlight boost
+  gets the same anchor from `middle/0.18`.
+- Contrast pivots on Middle greys. Anything above the peak goes through a shoulder
+  that is C1 at its knee and reaches the peak exactly at the brightest possible input.
+- The reference web extension computes in gamma-encoded extended sRGB against a
+  Windows SDR slider. Using nits and KDE's reported peak means its presets could not
+  be reused, and none of its code or values were copied, as it has no license.
+
+`ShaderTone::encoded()` is a CPU reference used only by tests; keep it in step with
+`input.comp`. `truehdr-desktop-gpu-test <dir> 0 0 x hdr shader|auto|rtx [profile.json]`
+compares the GPU output with it. Debanding dithers its output, so the comparison needs
+`"debanding":false`.
+
+A failed `DesktopGPU` constructor destroys GL objects it just made, before anything
+was submitted. `~Impl` therefore waits up to 100 ms for its retirement fence in that
+case; a zero-timeout poll cannot succeed there and used to quarantine the GPU until
+the next login. The effect also clears the previous engine's failure state when the
+engine changes.
+
+`QJsonObject::operator[]` on a non-const object inserts Null for a missing key, and
+the panel reads settings that way, so optional picture keys can be present but Null.
+`profiles::picture()` treats Null as unset; otherwise saving would fail validation.
+
+## Nix packaging
+
+`flake.nix` exposes `packages`, `overlays.default`, `nixosModules.default` and native
+`checks`. The module and overlay call `nix/package.nix` with the system's `pkgs`,
+because the effect must be built against the running KWin; the flake's own `packages`
+output only matches a system using the same nixpkgs.
+
+`TRUEHDR_SYSTEM_PACKAGE` covers what a read-only install changes: data moves to
+`$XDG_DATA_HOME/chaos-hdr` and the panel's launcher path toggles the overlay directly
+instead of running `desktop.py`. `TRUEHDR_RUNTIME_SITE`, `TRUEHDR_NGX`,
+`TRUEHDR_KWIN_INCLUDE`, `TRUEHDR_SHADER_PATH` and `TRUEHDR_PANEL` replace the paths
+assumed by the Python installer, whose defaults are unchanged.
+
+- The NGX SDK files mirror `sdk.py` and the TrueHDR wheel mirrors `bootstrap.sh`; update
+  them together. NGX verifies the signature of the TrueHDR library, so that derivation
+  sets `dontFixup` and the file stays byte-identical.
+- The static NGX loader dlopens the driver's `libnvidia-ngx.so` through the RUNPATH
+  added by `addDriverRunpath`. The TrueHDR library dlopens `libnvidia-ml.so.1` from a
+  memfd with no RUNPATH, which fails on NixOS, and NVIDIA's code then dereferences a
+  null list and crashes KWin. Adding NVML as a dependency with `patchelf --add-needed`
+  loads it first, so the later lookup by soname succeeds.
+- The module's `ExecStop` calls `prepareUnload` first, because unloading with GPU work
+  outstanding quarantines the GPU until the next login. The effect is deliberately not
+  listed in `kwinrc`: after a crash KWin restarts without it.

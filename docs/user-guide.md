@@ -53,14 +53,43 @@ Approval is explicit. Merely opening controls or highlighting an unapproved wind
 |---|---|
 | HDR | Enables HDR conversion independently of sharpening |
 | Sharpening | Enables sharpening independently of HDR |
-| Peak brightness | Automatic from KDE’s configured display; supported target 400–2,000 nits |
+| Engine | Auto, RTX HDR only or Shader only; see [HDR engines](#hdr-engines) |
+| Peak brightness | Automatic from KDE’s configured display; RTX HDR supports 400–2,000 nits, the shader engine 100–10,000 nits |
 | Middle greys | 10–100 nits |
 | Contrast | −100% to +100% |
 | Saturation | −100% to +100% |
 | Sharpen intensity | 0–100%; zero disables sharpening |
 | Ignore Film Grain | 0–100%; reduces amplification of fine grain during sharpening |
+| Edge-aware sharpening | Sharpens real edges only, leaving noise and smooth gradients alone and limiting halos |
+| Debanding | On by default. RTX HDR uses NVIDIA's debanding; the shader engine uses an adaptive filter |
+| Filter strength | 0–100%; strength of the adaptive filter |
+| Also filter before RTX HDR | Also runs the adaptive filter on the SDR picture sent to RTX HDR, at extra GPU cost |
 
 Debanding is enabled by default to smooth visible gradient steps. Ignore Film Grain is not a general denoiser. Sharpening is our implementation, not a calibrated reproduction of every Windows NVIDIA filter value.
+
+## HDR engines
+
+The **Engine** list chooses what converts SDR to HDR:
+
+- **Auto** uses RTX HDR. It switches to the shader engine if RTX HDR cannot start, fails while running, if the desktop is not rendering on an NVIDIA GPU, or if the display peak is outside 400–2,000 nits. The panel shows the engine in use and the reason. **Retry RTX HDR** tries again.
+- **RTX HDR only** never uses the shader engine. A failure leaves the window unchanged and reports the error, as earlier versions did.
+- **Shader only** never loads NVIDIA's engine.
+
+If KWin stops while RTX HDR is starting, the next session in Auto stays on the shader engine until you press **Retry RTX HDR**.
+
+Middle greys, Contrast and Saturation apply to both engines, but the same value will not look identical on each. **Shader engine tuning** holds the options that apply only to the shader engine:
+
+| Control | Behavior |
+|---|---|
+| Preset | Standard, Cinema, High dynamic, Soft natural, Bright highlights or Vivid; editing a value below changes this to Custom |
+| Tone curve | BT.2446 Method A follows the ITU SDR-to-HDR expansion. Highlight boost keeps SDR tones and lifts only the brightest part of the picture |
+| Peak output | 25–100% of the display peak |
+| Exposure | −2 to +2 stops, before tone mapping |
+| Colour boost | −100% to +100%, on top of Saturation |
+| Highlight start, Highlight gain | Highlight boost curve only: where the boost begins, and 0–5 stops added at SDR white |
+| Shadow start, Shadow depth | Darkens tones under the start level; zero depth leaves them unchanged |
+
+The engine and tuning values are saved in each profile. The fallback changes only the HDR conversion. Windows the direct path cannot import stay unchanged with any engine.
 
 ## Profiles
 
@@ -86,7 +115,7 @@ instant opening and closing. The default retains the animated Chaos HDR design.
 **More → Accessible controls** opens a native Qt controls window with labelled
 fields, keyboard navigation and the platform accessibility interface. It also
 appears as an action on the application launcher. It includes application
-approval, profiles, HDR and sharpening. It follows the desktop's text settings;
+approval, profiles, HDR engines, shader tuning, debanding and sharpening. It follows the desktop's text settings;
 full screen-reader validation is still part of release acceptance.
 
 Profile names support Unicode. The overlay uses installed fallback fonts for

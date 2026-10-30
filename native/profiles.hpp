@@ -1,26 +1,48 @@
 #pragma once
+#include <algorithm>
+#include <initializer_list>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSaveFile>
 #include <QStringList>
+#include "picture_settings.hpp"
 
 
 
 namespace profiles {
+inline const QJsonObject& pictureDefaults() {
+    static const QJsonObject values{{"hdr_enabled",true},{"sharpen_enabled",true},{"hdr_engine","auto"},
+        {"shader_preset","standard"},{"shader_curve","bt2446a"},{"shader_exposure",0},{"shader_peak",100},{"shader_saturation",10},
+        {"shader_highlight_start",75},{"shader_highlight_gain",100},{"shader_shadow_start",15},{"shader_shadow_crush",0},
+        {"deband_strength",30},{"deband_before_rtx",false},{"sharpen_adaptive",false}};
+    return values;
+}
 inline QJsonObject picture(const QJsonObject& config) {
     QJsonObject result;
     for (auto key : {"enabled", "debanding", "middle_gray", "contrast", "saturation", "sharpen_intensity", "ignore_film_grain"})
         if (config.contains(key)) result[key] = config[key];
-    result["hdr_enabled"]=config.contains("hdr_enabled")?config["hdr_enabled"]:QJsonValue(true);
-    result["sharpen_enabled"]=config.contains("sharpen_enabled")?config["sharpen_enabled"]:QJsonValue(true);
+    const auto& defaults=pictureDefaults();
+    for (auto it=defaults.begin();it!=defaults.end();++it) result[it.key()]=config[it.key()].isNull()||config[it.key()].isUndefined()?QJsonValue(it.value()):config[it.key()];
     return result;
 }
 inline bool valid(const QJsonObject& value) {
     for (auto key : {"enabled", "debanding"}) if (!value[key].isBool()) return false;
-    for (auto key : {"hdr_enabled", "sharpen_enabled"}) if (value.contains(key)&&!value[key].isBool()) return false;
+    for (auto key : {"hdr_enabled", "sharpen_enabled", "deband_before_rtx", "sharpen_adaptive"}) if (value.contains(key)&&!value[key].isBool()) return false;
+    auto oneOf=[&](const char* key,std::initializer_list<const char*> options){
+        if(!value.contains(key))return true;
+        for(auto option:options)if(value[key].toString()==option)return true;
+        return false;
+    };
+    if(!oneOf("hdr_engine",{"auto","rtx","shader"})||!oneOf("shader_curve",{"bt2446a","power"}))return false;
+    if(value.contains("shader_preset")&&value["shader_preset"].toString()!="custom"&&std::none_of(shaderPresets.begin(),shaderPresets.end(),[&](const auto& preset){return value["shader_preset"].toString()==preset.id;}))return false;
     struct Range { const char* key; int low, high; };
+    for (auto range : {Range{"shader_exposure",-200,200}, Range{"shader_peak",25,100}, Range{"shader_saturation",-100,100}, Range{"shader_highlight_start",30,95},
+                       Range{"shader_highlight_gain",0,500}, Range{"shader_shadow_start",0,50}, Range{"shader_shadow_crush",0,100}, Range{"deband_strength",0,100}}) {
+        auto number = value[range.key];
+        if (value.contains(range.key) && (!number.isDouble() || number.toDouble() != number.toInt() || number.toInt() < range.low || number.toInt() > range.high)) return false;
+    }
     for (auto range : {Range{"middle_gray",10,100}, Range{"contrast",-100,100}, Range{"saturation",-100,100},
                        Range{"sharpen_intensity",0,100}, Range{"ignore_film_grain",0,100}}) {
         auto number = value[range.key];

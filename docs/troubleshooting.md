@@ -22,6 +22,10 @@
 - Already-HDR content should not receive another SDR-to-HDR conversion.
 - Window scaling, transforms, child surfaces or color descriptions can make the current direct path ineligible. See [compatibility](compatibility.md).
 
+## The panel says the shader engine is in use
+
+Auto switched away from RTX HDR; the line under **Engine** gives the reason. Fix the cause if one is named, then press **Retry RTX HDR**. To see RTX HDR's error directly, choose **RTX HDR only**. After a driver update that breaks NGX, the shader engine keeps HDR working in the meantime.
+
 ## Startup or KWin update problems
 
 If Alt+Z stops opening the overlay after a desktop update, the shortcut service
